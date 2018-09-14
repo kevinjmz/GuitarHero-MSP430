@@ -1,0 +1,304 @@
+/** \file shapemotion.c
+ *  \brief This is a simple shape motion demo.
+ *  This demo creates two layers containing shapes.
+ *  One layer contains a rectangle and the other a circle.
+ *  While the CPU is running the green LED is on, and
+ *  when the screen does not need to be redrawn the CPU
+ *  is turned off along with the green LED.
+ */  
+#include <msp430.h>
+#include <libTimer.h>
+#include <lcdutils.h>
+#include <lcddraw.h>
+#include <p2switches.h>
+#include <shape.h>
+#include <abCircle.h>
+
+
+#define GREEN_LED BIT6
+#define MIN_PERIOD 1000
+#define MAX_PERIOD 4000
+
+
+static unsigned int period = 2000;
+static signed int rate = 200;	
+
+int a = 300;
+int b = 200;
+int silence =0;
+int counter = 0;
+int frequency [46]={440,440,440,349,523,440,349,523,440,0,659,659,659,698,523,415,349,523,440,0,880,440,440,880,830,784,740,698,740,0,455,622,587,554,523,466,523,0,349,415,349,523,440,344,523,440};
+
+
+
+void buzzer_init();
+void buzzer_advance_frequency(int);
+void buzzer_set_period(short);
+void change_tone();
+void buzzer_song_pause();
+
+AbRect rect10 = {abRectGetBounds, abRectCheck, {10,10}}; /**< 10x10 rectangle */
+
+AbRectOutline fieldOutline = {	/* playing field */
+  abRectOutlineGetBounds, abRectOutlineCheck,   
+  {screenWidth/2-4, screenHeight/2-4}
+};
+
+Layer layer5 = {
+    (AbShape *) &circle8,
+    //{(screenWidth/2)+10, (screenHeight/2)+5}, /**< bit below & right of center */
+    {21,20},
+  {0,0}, {0,0},				    /* last & next pos */
+  COLOR_BLUE,
+  0
+};
+  
+
+Layer layer3 = {		/**< Layer with an orange circle */
+  (AbShape *)&circle8,
+  //{(screenWidth/2)+10, (screenHeight/2)+5}, /**< bit below & right of center */
+  {48,20},
+  {0,0}, {0,0},				    /* last & next pos */
+  COLOR_VIOLET,
+  &layer5,
+};
+
+
+Layer fieldLayer = {		/* playing field as a layer */
+  (AbShape *) &fieldOutline,
+  {screenWidth/2, screenHeight/2},/**< center */
+  //{75,20},
+  {0,0}, {0,0},				    /* last & next pos */
+  COLOR_BLACK,
+  &layer3
+};
+
+Layer layer1 = {		/**< Layer with a red square */
+  (AbShape *)&circle8,
+  //{screenWidth/2, screenHeight/2}, /**< center */
+  {75,20},
+  {0,0}, {0,0},				    /* last & next pos */
+  COLOR_RED,
+  &fieldLayer,
+};
+
+Layer layer0 = {		/**< Layer with an orange circle */
+  (AbShape *)&circle8,
+  //{(screenWidth/2)+10, (screenHeight/2)+5}, /**< bit below & right of center */
+  {102,20},
+  {0,0}, {0,0},				    /* last & next pos */
+  COLOR_ORANGE,
+  &layer1,
+};
+
+
+
+/** Moving Layer
+ *  Linked list of layer references
+ *  Velocity represents one iteration of change (direction & magnitude)
+ */
+typedef struct MovLayer_s {
+  Layer *layer;
+  Vec2 velocity;
+  struct MovLayer_s *next;
+} MovLayer;
+
+
+
+MovLayer ml5 = { &layer5, {0,5}, 0 };
+//MovLayer ml3 = { &layer3, {0,5}, &ml5 }; /**< not all layers move */
+MovLayer  ml3 = { &layer3, {0,5}, 0};
+//MovLayer ml1 = { &layer1, {0,5}, &ml3 }; 
+//MovLayer ml0 = { &layer0, {0,5}, &ml1 }; 
+
+
+void movLayerDraw(MovLayer *movLayers, Layer *layers)
+{
+  int row, col;
+  MovLayer *movLayer;
+
+  and_sr(~8);			/**< disable interrupts (GIE off) */
+  for (movLayer = movLayers; movLayer; movLayer = movLayer->next) { /* for each moving layer */
+    Layer *l = movLayer->layer;
+    l->posLast = l->pos;
+    l->pos = l->posNext;
+  }
+  or_sr(8);			/**< disable interrupts (GIE on) */
+
+
+  for (movLayer = movLayers; movLayer; movLayer = movLayer->next) { /* for each moving layer */
+    Region bounds;
+    layerGetBounds(movLayer->layer, &bounds);
+    lcd_setArea(bounds.topLeft.axes[0], bounds.topLeft.axes[1], 
+		bounds.botRight.axes[0], bounds.botRight.axes[1]);
+    
+    for (row = bounds.topLeft.axes[1]; row <= bounds.botRight.axes[1]; row++) {
+      for (col = bounds.topLeft.axes[0]; col <= bounds.botRight.axes[0]; col++) {
+        Vec2 pixelPos = {col, row};
+        u_int color = bgColor;
+        Layer *probeLayer;
+        for (probeLayer = layers; probeLayer; probeLayer = probeLayer->next) { /* probe all layers, in order */
+            if (abShapeCheck(probeLayer->abShape, &probeLayer->pos, &pixelPos)) {
+                color = probeLayer->color;
+                break; 
+            } /* if probe check */
+        } // for checking all layers at col, row
+        lcd_writeColor(color); 
+      } // for col
+    } // for row
+  } // for moving layer being updated
+}	  
+
+
+
+//Region fence = {{10,30}, {SHORT_EDGE_PIXELS-10, LONG_EDGE_PIXELS-10}}; /**< Create a fence region */
+
+/** Advances a moving shape within a fence
+ *  
+ *  \param ml The moving shape to be advranced
+ *  \param fence The region which will serve as a boundary for ml
+ */
+void mlAdvance(MovLayer *ml, Region *fence)
+{
+  Vec2 newPos;
+  u_char axis;
+  Region shapeBoundary;
+  for (; ml; ml = ml->next) {
+    vec2Add(&newPos, &ml->layer->posNext, &ml->velocity);
+    abShapeGetBounds(ml->layer->abShape, &newPos, &shapeBoundary);
+    for (axis = 0; axis < 2; axis ++) {
+      if ((shapeBoundary.topLeft.axes[axis] < fence->topLeft.axes[axis]) || (shapeBoundary.botRight.axes[axis] > fence->botRight.axes[axis]) ) {
+	int velocity = ml->velocity.axes[axis] = -ml->velocity.axes[axis];
+	newPos.axes[axis] += (2*velocity);
+    newPos.axes[axis] += 1;
+      }	/**< if outside of fence */
+    } /**< for axis */
+    ml->layer->posNext = newPos;
+  } /**< for ml */
+
+}
+
+
+u_int bgColor = COLOR_BLACK;     /**< The background color */
+int redrawScreen = 1;           /**< Boolean for whether screen needs to be redrawn */
+
+Region fieldFence;		/**< fence around playing field  */
+
+
+/** Initializes everything, enables interrupts and green LED, 
+ *  and handles the rendering for the screen
+ */
+void main()
+{
+  P1DIR |= GREEN_LED;		/**< Green led on when CPU on */		
+  P1OUT |= GREEN_LED;
+
+  configureClocks();
+  lcd_init();
+  shapeInit();
+  p2sw_init(15);
+
+  shapeInit();
+
+  layerInit(&layer0);
+  layerDraw(&layer0);
+
+
+  layerGetBounds(&fieldLayer, &fieldFence);
+
+    configureClocks();		/* setup master oscillator, CPU & peripheral clocks */
+    buzzer_init();
+  
+  
+  enableWDTInterrupts();      /**< enable periodic interrupt */
+  or_sr(0x8);	              /**< GIE (enable interrupts) */
+
+
+  for(;;) { 
+    while (!redrawScreen) { /**< Pause CPU if screen doesn't need updating */
+      P1OUT &= ~GREEN_LED;    /**< Green led off witHo CPU */
+      or_sr(0x10);	      /**< CPU OFF */
+    }
+    P1OUT |= GREEN_LED;       /**< Green led on when CPU on */
+    redrawScreen = 0;
+    //movLayerDraw(&ml0, &layer0);
+    movLayerDraw(&ml5, &layer0);
+    //new
+    movLayerDraw(&ml3, &layer0);
+    
+    
+    movLayerDraw(0, &layer0);
+  }
+}
+
+////////////////////////////////FOR BUZZER////////////////////
+void buzzer_init()
+{
+    /* 
+       Direct timer A output "TA0.1" to P2.6.  
+        According to table 21 from data sheet:
+          P2SEL2.6, P2SEL2.7, anmd P2SEL.7 must be zero
+          P2SEL.6 must be 1
+        Also: P2.6 direction must be output
+    */
+    timerAUpmode();		/* used to drive speaker */
+    P2SEL2 &= ~(BIT6 | BIT7);
+    P2SEL &= ~BIT7; 
+    P2SEL |= BIT6;
+    P2DIR = BIT6;		/* enable output to speaker (P2.6) */
+    //buzzer_advance_frequency();	/* start buzzing!!! */
+}
+void buzzer_advance_frequency(int tone) 
+{
+
+    if(period<MAX_PERIOD){
+    rate=frequency[counter];
+    }
+    else{
+    rate=silence;
+    }
+    period = rate;
+  
+buzzer_set_period(period);
+ change_tone();
+}
+
+void buzzer_set_period(short cycles)
+{
+  CCR0 = cycles;
+  CCR1 = cycles >> 1;		/* one half cycle */
+}
+
+void change_tone(){
+  if(counter<46){
+    counter++;
+}
+  else
+    counter=0;
+}
+
+void buzzer_song_pause(){
+    period=silence;
+    buzzer_set_period(period);
+}
+
+/** Watchdog timer interrupt handler. 15 interrupts/sec */
+void wdt_c_handler()
+{
+  static short count = 0;
+  static short count2 = 0;
+  P1OUT |= GREEN_LED;		      /**< Green LED on when cpu on */
+count ++;
+  if (count == 15) {
+    //mlAdvance(&ml0, &fieldFence);
+      mlAdvance(&ml5, &fieldFence);
+      mlAdvance(&ml3, &fieldFence);
+
+      buzzer_advance_frequency(1);
+    if (p2sw_read())
+      redrawScreen = 1;
+    count = 0;
+  } 
+
+  P1OUT &= ~GREEN_LED;		    /**< Green LED off when cpu off */
+}
